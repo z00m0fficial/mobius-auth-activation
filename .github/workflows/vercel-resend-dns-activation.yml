@@ -1,0 +1,182 @@
+name: Vercel Resend DNS Activation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/vercel-resend-dns-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  apply-resend-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      DOMAIN: mobiuscommand.live
+      TEAM_ID: team_GHfqpICAl1KywvDngfAW7TR6
+
+    steps:
+      - name: Add only missing Resend and DMARC records
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${VERCEL_TOKEN:-}" ]]; then
+            echo "VERCEL_TOKEN is missing."
+            exit 1
+          fi
+
+          records_file="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "${records_file}" "${response_file}"' EXIT
+
+          list_code="$(curl \
+            --silent \
+            --show-error \
+            --output "${records_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v5/domains/${DOMAIN}/records?limit=100&teamId=${TEAM_ID}")"
+
+          if [[ "${list_code}" -lt 200 || "${list_code}" -ge 300 ]]; then
+            echo "Unable to read Vercel DNS records. HTTP ${list_code}."
+            exit 1
+          fi
+
+          create_record() {
+            local output_name="$1"
+            local name="$2"
+            local type="$3"
+            local value="$4"
+            local priority="${5:-}"
+            local exact same payload code
+
+            if [[ "${type}" == "MX" ]]; then
+              exact="$(jq --arg n "${name}" --arg t "${type}" --arg v "${value}" --argjson p "${priority}" '[.records[]? | select((.name // "") == $n and .type == $t and (.value // "") == $v and (.mx.priority // .priority // 0) == $p)] | length' "${records_file}")"
+            else
+              exact="$(jq --arg n "${name}" --arg t "${type}" --arg v "${value}" '[.records[]? | select((.name // "") == $n and .type == $t and (.value // "") == $v)] | length' "${records_file}")"
+            fi
+
+            same="$(jq --arg n "${name}" --arg t "${type}" '[.records[]? | select((.name // "") == $n and .type == $t)] | length' "${records_file}")"
+
+            if [[ "${exact}" -gt 0 ]]; then
+              echo "${output_name}=ALREADY_PRESENT" >> "${GITHUB_OUTPUT}"
+              return 0
+            fi
+
+            if [[ "${same}" -gt 0 ]]; then
+              echo "${output_name}=CONFLICT_REVIEW_REQUIRED" >> "${GITHUB_OUTPUT}"
+              return 0
+            fi
+
+            if [[ "${type}" == "MX" ]]; then
+              payload="$(jq -n \
+                --arg type "${type}" \
+                --arg name "${name}" \
+                --arg value "${value}" \
+                --argjson priority "${priority}" \
+                '{type:$type,name:$name,value:$value,ttl:60,mx:{priority:$priority}}')"
+            else
+              payload="$(jq -n \
+                --arg type "${type}" \
+                --arg name "${name}" \
+                --arg value "${value}" \
+                '{type:$type,name:$name,value:$value,ttl:60}')"
+            fi
+
+            code="$(curl \
+              --silent \
+              --show-error \
+              --output "${response_file}" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+              --header 'Content-Type: application/json' \
+              "https://api.vercel.com/v2/domains/${DOMAIN}/records?teamId=${TEAM_ID}" \
+              --data "${payload}")"
+
+            if [[ "${code}" -ge 200 && "${code}" -lt 300 ]]; then
+              echo "${output_name}=CREATED" >> "${GITHUB_OUTPUT}"
+            else
+              echo "${output_name}=FAILED_HTTP_${code}" >> "${GITHUB_OUTPUT}"
+            fi
+
+            : > "${response_file}"
+          }
+
+          create_record \
+            dkim \
+            'resend._domainkey.auth' \
+            'TXT' \
+            'p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwgG2iWs75ucc4rEkxw5zCXEDixVGFU4N8CFnzLkC2udN0+LtmTbPncnqRhfkJBSu0R1lXE3DnFFSKWN4ZMLh00aTJAHQlRuo0qLppNLoArzo5Nm9tZvEzGzZdmBs/SCApVqEocgebswpANSkJ0HCwG3kdLZeGDS2nLDUlPdil+QIDAQAB'
+
+          create_record \
+            mail_from_mx \
+            'send.auth' \
+            'MX' \
+            'feedback-smtp.us-east-1.amazonses.com' \
+            10
+
+          create_record \
+            mail_from_spf \
+            'send.auth' \
+            'TXT' \
+            'v=spf1 include:amazonses.com ~all'
+
+          create_record \
+            dmarc \
+            '_dmarc.auth' \
+            'TXT' \
+            'v=DMARC1; p=none; adkim=s; aspf=s; pct=100'
+
+      - name: Publish sanitized DNS activation report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DKIM_RESULT: ${{ steps.apply.outputs.dkim }}
+          MX_RESULT: ${{ steps.apply.outputs.mail_from_mx }}
+          SPF_RESULT: ${{ steps.apply.outputs.mail_from_spf }}
+          DMARC_RESULT: ${{ steps.apply.outputs.dmarc }}
+        run: |
+          set -euo pipefail
+
+          body=$(cat <<EOF
+          ## Vercel Resend DNS activation
+
+          - DKIM TXT: **${DKIM_RESULT:-WORKFLOW_FAILED}**
+          - MAIL FROM MX: **${MX_RESULT:-WORKFLOW_FAILED}**
+          - MAIL FROM SPF TXT: **${SPF_RESULT:-WORKFLOW_FAILED}**
+          - DMARC TXT: **${DMARC_RESULT:-WORKFLOW_FAILED}**
+
+          Commit: ${GITHUB_SHA}
+
+          Safety controls: only completely absent records were created. No existing record was deleted, replaced, or overwritten. Same-name/type mismatches are reported for review. No token or secret values were printed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title 'Vercel Resend DNS Activation Report' --arg body "${body}" '{title:$title,body:$body}')"
+
+          code="$(curl \
+            --silent \
+            --show-error \
+            --output /tmp/issue.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
