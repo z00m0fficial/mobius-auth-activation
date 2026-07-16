@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - .github/workflows/namecom-connection-test.yml
 
 permissions:
   contents: read
