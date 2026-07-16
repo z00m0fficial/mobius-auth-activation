@@ -1,0 +1,157 @@
+name: Vercel Domain Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/vercel-domain-diagnostic-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  inspect-vercel-domain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      DOMAIN: mobiuscommand.live
+      TEAM_ID: team_GHfqpICAl1KywvDngfAW7TR6
+
+    steps:
+      - name: Inspect domain registration and DNS control
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${VERCEL_TOKEN:-}" ]]; then
+            echo "VERCEL_TOKEN is missing from GitHub Actions secrets."
+            exit 1
+          fi
+
+          domain_file="$(mktemp)"
+          records_file="$(mktemp)"
+          trap 'rm -f "${domain_file}" "${records_file}"' EXIT
+
+          domain_code="$(curl \
+            --silent \
+            --show-error \
+            --output "${domain_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v5/domains/${DOMAIN}?teamId=${TEAM_ID}")"
+
+          records_code="$(curl \
+            --silent \
+            --show-error \
+            --output "${records_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v5/domains/${DOMAIN}/records?limit=100&teamId=${TEAM_ID}")"
+
+          service_type='UNKNOWN'
+          verified='UNKNOWN'
+          bought_at='UNKNOWN'
+          nameservers='UNKNOWN'
+          intended_nameservers='UNKNOWN'
+
+          if [[ "${domain_code}" -ge 200 && "${domain_code}" -lt 300 ]] && jq -e . "${domain_file}" >/dev/null 2>&1; then
+            service_type="$(jq -r '.domain.serviceType // .serviceType // "UNKNOWN"' "${domain_file}")"
+            verified="$(jq -r '.domain.verified // .verified // "UNKNOWN"' "${domain_file}")"
+            bought_at="$(jq -r '.domain.boughtAt // .boughtAt // "UNKNOWN"' "${domain_file}")"
+            nameservers="$(jq -r '(.domain.nameservers // .nameservers // []) | join(", ") | if length == 0 then "NONE_REPORTED" else . end' "${domain_file}")"
+            intended_nameservers="$(jq -r '(.domain.intendedNameservers // .intendedNameservers // []) | join(", ") | if length == 0 then "NONE_REPORTED" else . end' "${domain_file}")"
+          fi
+
+          record_count='UNKNOWN'
+          dkim='UNKNOWN'
+          mail_from_mx='UNKNOWN'
+          mail_from_spf='UNKNOWN'
+
+          if [[ "${records_code}" -ge 200 && "${records_code}" -lt 300 ]] && jq -e . "${records_file}" >/dev/null 2>&1; then
+            record_count="$(jq -r '(.records // .) | if type == "array" then length else "UNKNOWN" end' "${records_file}")"
+            dkim="$(jq -r '(.records // .) as $r | if ($r | type) != "array" then "UNKNOWN" elif any($r[]; (.type == "TXT") and ((.name // "") == "resend._domainkey.auth") and ((.value // "") | startswith("p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwgG2iWs75"))) then "PRESENT" else "MISSING" end' "${records_file}")"
+            mail_from_mx="$(jq -r '(.records // .) as $r | if ($r | type) != "array" then "UNKNOWN" elif any($r[]; (.type == "MX") and ((.name // "") == "send.auth") and ((.value // "") == "feedback-smtp.us-east-1.amazonses.com")) then "PRESENT" else "MISSING" end' "${records_file}")"
+            mail_from_spf="$(jq -r '(.records // .) as $r | if ($r | type) != "array" then "UNKNOWN" elif any($r[]; (.type == "TXT") and ((.name // "") == "send.auth") and ((.value // "") == "v=spf1 include:amazonses.com ~all")) then "PRESENT" else "MISSING" end' "${records_file}")"
+          fi
+
+          {
+            echo "domain_code=${domain_code}"
+            echo "records_code=${records_code}"
+            echo "service_type=${service_type}"
+            echo "verified=${verified}"
+            echo "bought_at=${bought_at}"
+            echo "nameservers=${nameservers}"
+            echo "intended_nameservers=${intended_nameservers}"
+            echo "record_count=${record_count}"
+            echo "dkim=${dkim}"
+            echo "mail_from_mx=${mail_from_mx}"
+            echo "mail_from_spf=${mail_from_spf}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish sanitized Vercel domain report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOMAIN_CODE: ${{ steps.inspect.outputs.domain_code }}
+          RECORDS_CODE: ${{ steps.inspect.outputs.records_code }}
+          SERVICE_TYPE: ${{ steps.inspect.outputs.service_type }}
+          VERIFIED: ${{ steps.inspect.outputs.verified }}
+          BOUGHT_AT: ${{ steps.inspect.outputs.bought_at }}
+          NAMESERVERS: ${{ steps.inspect.outputs.nameservers }}
+          INTENDED_NAMESERVERS: ${{ steps.inspect.outputs.intended_nameservers }}
+          RECORD_COUNT: ${{ steps.inspect.outputs.record_count }}
+          DKIM: ${{ steps.inspect.outputs.dkim }}
+          MAIL_FROM_MX: ${{ steps.inspect.outputs.mail_from_mx }}
+          MAIL_FROM_SPF: ${{ steps.inspect.outputs.mail_from_spf }}
+        run: |
+          set -euo pipefail
+
+          body=$(cat <<EOF
+          ## Vercel domain diagnostic
+
+          - Domain API HTTP: **${DOMAIN_CODE:-WORKFLOW_FAILED}**
+          - DNS records API HTTP: **${RECORDS_CODE:-WORKFLOW_FAILED}**
+          - Service type: **${SERVICE_TYPE:-UNKNOWN}**
+          - Verified: **${VERIFIED:-UNKNOWN}**
+          - Purchased timestamp: **${BOUGHT_AT:-UNKNOWN}**
+          - Active nameservers: **${NAMESERVERS:-UNKNOWN}**
+          - Intended nameservers: **${INTENDED_NAMESERVERS:-UNKNOWN}**
+          - Vercel DNS record count: **${RECORD_COUNT:-UNKNOWN}**
+
+          ## Resend readiness
+
+          - DKIM: **${DKIM:-UNKNOWN}**
+          - MAIL FROM MX: **${MAIL_FROM_MX:-UNKNOWN}**
+          - MAIL FROM SPF: **${MAIL_FROM_SPF:-UNKNOWN}**
+
+          Commit: ${GITHUB_SHA}
+
+          Read-only diagnostic. No Vercel domain, DNS, deployment, email, Supabase, database, or production configuration was changed. No token values or personal account information were printed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title 'Vercel Domain Diagnostic Report' --arg body "${body}" '{title:$title,body:$body}')"
+
+          code="$(curl \
+            --silent \
+            --show-error \
+            --output /tmp/issue.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
