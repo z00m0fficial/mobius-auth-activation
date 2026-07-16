@@ -5,9 +5,12 @@ on:
   push:
     branches:
       - main
+    paths:
+      - .github/namecom-test-trigger
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   verify-namecom-api:
@@ -19,43 +22,99 @@ jobs:
       NAMECOM_API_TOKEN: ${{ secrets.NAMECOM_API_TOKEN }}
 
     steps:
-      - name: Validate required secrets
+      - name: Run read-only Name.com authentication test
+        id: namecom_test
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
 
-          if [[ -z "${NAMECOM_USERNAME}" ]]; then
-            echo "NAMECOM_USERNAME is missing."
+          set_result() {
+            echo "result=$1" >> "${GITHUB_OUTPUT}"
+            echo "detail=$2" >> "${GITHUB_OUTPUT}"
+          }
+
+          if [[ -z "${NAMECOM_USERNAME:-}" ]]; then
+            set_result "failure" "NAMECOM_USERNAME is missing from GitHub Actions secrets."
             exit 1
           fi
 
-          if [[ -z "${NAMECOM_API_TOKEN}" ]]; then
-            echo "NAMECOM_API_TOKEN is missing."
+          if [[ -z "${NAMECOM_API_TOKEN:-}" ]]; then
+            set_result "failure" "NAMECOM_API_TOKEN is missing from GitHub Actions secrets."
             exit 1
           fi
-
-          echo "Required Name.com secrets are configured."
-
-      - name: Test Name.com CORE API authentication
-        shell: bash
-        run: |
-          set -euo pipefail
 
           response_file="$(mktemp)"
           trap 'rm -f "${response_file}"' EXIT
 
-          status_code="$(curl \
+          if ! status_code="$(curl \
             --silent \
             --show-error \
             --output "${response_file}" \
             --write-out "%{http_code}" \
             --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
             --header "Accept: application/json" \
-            "https://api.name.com/core/v1/hello")"
-
-          if [[ "${status_code}" -lt 200 || "${status_code}" -ge 300 ]]; then
-            echo "Name.com API authentication failed with HTTP ${status_code}."
+            "https://api.name.com/core/v1/hello")"; then
+            set_result "failure" "The Name.com API request could not be completed."
             exit 1
           fi
 
+          if [[ "${status_code}" -lt 200 || "${status_code}" -ge 300 ]]; then
+            set_result "failure" "Name.com rejected the authentication request with HTTP ${status_code}."
+            exit 1
+          fi
+
+          set_result "success" "Name.com CORE API authentication succeeded using the encrypted repository secrets."
           echo "Name.com CORE API authentication succeeded."
+
+      - name: Create GitHub verification report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_RESULT: ${{ steps.namecom_test.outputs.result }}
+          TEST_DETAIL: ${{ steps.namecom_test.outputs.detail }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${TEST_RESULT}" == "success" ]]; then
+            title="Name.com Connection Test — PASSED"
+          else
+            title="Name.com Connection Test — FAILED"
+          fi
+
+          body="Automated read-only verification result: **${TEST_RESULT:-failure}**\n\n${TEST_DETAIL:-The workflow did not produce a diagnostic message.}\n\nCommit: ${GITHUB_SHA}\n\nNo DNS records, Name.com settings, deployments, Supabase resources, or production configuration were modified. No secret values were printed."
+
+          payload="$(jq -n --arg title "${title}" --arg body "${body}" '{title: $title, body: $body}')"
+
+          http_code="$(curl \
+            --silent \
+            --show-error \
+            --output /tmp/issue-response.json \
+            --write-out "%{http_code}" \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          if [[ "${http_code}" != "201" ]]; then
+            echo "Unable to create the GitHub verification report. HTTP ${http_code}."
+            exit 1
+          fi
+
+          echo "GitHub verification report created."
+
+      - name: Enforce verification result
+        if: always()
+        shell: bash
+        env:
+          TEST_RESULT: ${{ steps.namecom_test.outputs.result }}
+        run: |
+          if [[ "${TEST_RESULT}" != "success" ]]; then
+            echo "Name.com connection verification failed."
+            exit 1
+          fi
+
+          echo "Name.com connection verification passed."
