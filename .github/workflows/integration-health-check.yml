@@ -1,0 +1,173 @@
+name: Mobius Integration Health Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/integration-health-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify-integrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      NAMECOM_USERNAME: ${{ secrets.NAMECOM_USERNAME }}
+      NAMECOM_API_TOKEN: ${{ secrets.NAMECOM_API_TOKEN }}
+      RESEND_SMTP_PASSWORD: ${{ secrets.RESEND_SMTP_PASSWORD }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+    steps:
+      - name: Verify Name.com API credentials
+        id: namecom
+        shell: bash
+        run: |
+          set +e
+          if [[ -z "${NAMECOM_USERNAME:-}" || -z "${NAMECOM_API_TOKEN:-}" ]]; then
+            echo "status=FAIL" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            'https://api.name.com/core/v1/hello')"
+
+          if [[ "${code}" -ge 200 && "${code}" -lt 300 ]]; then
+            echo "status=PASS" >> "${GITHUB_OUTPUT}"
+          else
+            echo "status=FAIL" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Verify Resend SMTP credentials without sending email
+        id: resend
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'PY'
+          import os
+          import smtplib
+          import ssl
+
+          output = os.environ.get("GITHUB_OUTPUT")
+          password = os.environ.get("RESEND_SMTP_PASSWORD", "")
+          status = "FAIL"
+
+          if password:
+              try:
+                  context = ssl.create_default_context()
+                  with smtplib.SMTP_SSL("smtp.resend.com", 465, timeout=20, context=context) as client:
+                      client.login("resend", password)
+                  status = "PASS"
+              except Exception:
+                  status = "FAIL"
+
+          with open(output, "a", encoding="utf-8") as fh:
+              fh.write(f"status={status}\n")
+          PY
+
+      - name: Verify Supabase Management API token
+        id: supabase
+        shell: bash
+        run: |
+          set +e
+          if [[ -z "${SUPABASE_ACCESS_TOKEN:-}" ]]; then
+            echo "status=FAIL" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          code="$(curl --silent --show-error --output /tmp/supabase-projects.json --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            --header 'Accept: application/json' \
+            'https://api.supabase.com/v1/projects')"
+
+          if [[ "${code}" -ge 200 && "${code}" -lt 300 ]] && jq -e 'type == "array"' /tmp/supabase-projects.json >/dev/null 2>&1; then
+            echo "status=PASS" >> "${GITHUB_OUTPUT}"
+          else
+            echo "status=FAIL" >> "${GITHUB_OUTPUT}"
+          fi
+          rm -f /tmp/supabase-projects.json
+
+      - name: Audit public DNS for Resend
+        id: dns
+        shell: bash
+        run: |
+          set +e
+
+          if ! command -v dig >/dev/null 2>&1; then
+            sudo apt-get update -qq >/dev/null 2>&1
+            sudo apt-get install -y -qq dnsutils >/dev/null 2>&1
+          fi
+
+          dkim_expected='p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwgG2iWs75ucc4rEkxw5zCXEDixVGFU4N8CFnzLkC2udN0+LtmTbPncnqRhfkJBSu0R1lXE3DnFFSKWN4ZMLh00aTJAHQlRuo0qLppNLoArzo5Nm9tZvEzGzZdmBs/SCApVqEocgebswpANSkJ0HCwG3kdLZeGDS2nLDUlPdil+QIDAQAB'
+          spf_expected='v=spf1 include:amazonses.com ~all'
+          mx_expected='10 feedback-smtp.us-east-1.amazonses.com.'
+
+          dkim_actual="$(dig +short TXT resend._domainkey.auth.mobiuscommand.live | tr -d '"' | tr -d '\n')"
+          spf_actual="$(dig +short TXT send.auth.mobiuscommand.live | tr -d '"' | tr -d '\n')"
+          mx_actual="$(dig +short MX send.auth.mobiuscommand.live | head -n 1 | xargs)"
+          dmarc_actual="$(dig +short TXT _dmarc.auth.mobiuscommand.live | tr -d '"' | tr -d '\n')"
+
+          [[ "${dkim_actual}" == "${dkim_expected}" ]] && dkim_status='PASS' || dkim_status='MISSING_OR_MISMATCHED'
+          [[ "${spf_actual}" == "${spf_expected}" ]] && spf_status='PASS' || spf_status='MISSING_OR_MISMATCHED'
+          [[ "${mx_actual}" == "${mx_expected}" ]] && mx_status='PASS' || mx_status='MISSING_OR_MISMATCHED'
+          [[ "${dmarc_actual}" == v=DMARC1* ]] && dmarc_status='PRESENT' || dmarc_status='NOT_PRESENT'
+
+          echo "dkim=${dkim_status}" >> "${GITHUB_OUTPUT}"
+          echo "spf=${spf_status}" >> "${GITHUB_OUTPUT}"
+          echo "mx=${mx_status}" >> "${GITHUB_OUTPUT}"
+          echo "dmarc=${dmarc_status}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish sanitized verification report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAMECOM_STATUS: ${{ steps.namecom.outputs.status }}
+          RESEND_STATUS: ${{ steps.resend.outputs.status }}
+          SUPABASE_STATUS: ${{ steps.supabase.outputs.status }}
+          DKIM_STATUS: ${{ steps.dns.outputs.dkim }}
+          SPF_STATUS: ${{ steps.dns.outputs.spf }}
+          MX_STATUS: ${{ steps.dns.outputs.mx }}
+          DMARC_STATUS: ${{ steps.dns.outputs.dmarc }}
+        run: |
+          set -euo pipefail
+
+          title="Mobius Integration Health Check"
+          body=$(cat <<EOF
+          ## Credential checks
+
+          - Name.com API: **${NAMECOM_STATUS:-FAIL}**
+          - Resend SMTP authentication: **${RESEND_STATUS:-FAIL}**
+          - Supabase Management API: **${SUPABASE_STATUS:-FAIL}**
+
+          ## Resend DNS audit
+
+          - DKIM: **${DKIM_STATUS:-UNKNOWN}**
+          - MAIL FROM SPF: **${SPF_STATUS:-UNKNOWN}**
+          - MAIL FROM MX: **${MX_STATUS:-UNKNOWN}**
+          - DMARC on auth.mobiuscommand.live: **${DMARC_STATUS:-UNKNOWN}**
+
+          Commit: ${GITHUB_SHA}
+
+          This workflow sent no email and made no DNS, Supabase, database, deployment, or production configuration changes. No secret values were printed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title "${title}" --arg body "${body}" '{title: $title, body: $body}')"
+          code="$(curl --silent --show-error --output /tmp/issue.json --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
