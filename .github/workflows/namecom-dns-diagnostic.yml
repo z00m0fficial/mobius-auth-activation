@@ -50,7 +50,7 @@ jobs:
           records_code="$(curl --silent --show-error --output "${records_file}" --write-out '%{http_code}' \
             --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
             --header 'Accept: application/json' \
-            "https://api.name.com/core/v1/domains/${TARGET_ZONE}/records')"
+            "https://api.name.com/core/v1/domains/${TARGET_ZONE}/records")"
 
           records_shape='UNKNOWN'
           api_message='NONE'
