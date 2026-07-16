@@ -2,6 +2,11 @@ name: Name.com Connection Test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/namecom-connection-test.yml
 
 permissions:
   contents: read
@@ -39,6 +44,7 @@ jobs:
           set -euo pipefail
 
           response_file="$(mktemp)"
+          trap 'rm -f "${response_file}"' EXIT
 
           status_code="$(curl \
             --silent \
@@ -51,9 +57,7 @@ jobs:
 
           if [[ "${status_code}" -lt 200 || "${status_code}" -ge 300 ]]; then
             echo "Name.com API authentication failed with HTTP ${status_code}."
-            cat "${response_file}"
             exit 1
           fi
 
           echo "Name.com CORE API authentication succeeded."
-          cat "${response_file}"
