@@ -1,0 +1,59 @@
+name: Name.com Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-namecom-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      NAMECOM_USERNAME: ${{ secrets.NAMECOM_USERNAME }}
+      NAMECOM_API_TOKEN: ${{ secrets.NAMECOM_API_TOKEN }}
+
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NAMECOM_USERNAME}" ]]; then
+            echo "NAMECOM_USERNAME is missing."
+            exit 1
+          fi
+
+          if [[ -z "${NAMECOM_API_TOKEN}" ]]; then
+            echo "NAMECOM_API_TOKEN is missing."
+            exit 1
+          fi
+
+          echo "Required Name.com secrets are configured."
+
+      - name: Test Name.com CORE API authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+
+          status_code="$(curl \
+            --silent \
+            --show-error \
+            --output "${response_file}" \
+            --write-out "%{http_code}" \
+            --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+            --header "Accept: application/json" \
+            "https://api.name.com/core/v1/hello")"
+
+          if [[ "${status_code}" -lt 200 || "${status_code}" -ge 300 ]]; then
+            echo "Name.com API authentication failed with HTTP ${status_code}."
+            cat "${response_file}"
+            exit 1
+          fi
+
+          echo "Name.com CORE API authentication succeeded."
+          cat "${response_file}"
