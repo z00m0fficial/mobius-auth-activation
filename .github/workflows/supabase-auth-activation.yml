@@ -1,0 +1,72 @@
+name: Supabase Auth Activation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/supabase-auth-activation-trigger]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      RESEND_SMTP_PASSWORD: ${{ secrets.RESEND_SMTP_PASSWORD }}
+      PROJECT_REF: seufspsduhqqebxoqakt
+    steps:
+      - name: Configure custom SMTP and redirects
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${SUPABASE_ACCESS_TOKEN:-}" ]]
+          [[ -n "${RESEND_SMTP_PASSWORD:-}" ]]
+
+          curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
+            -o /tmp/before.json
+
+          current="$(jq -r '.uri_allow_list // ""' /tmp/before.json)"
+          allow="$(printf '%s\n%s\n%s\n' "$current" 'https://mobiuscommand.live/auth/recovery' 'mobiuscompanion://auth/recovery' | tr ',' '\n' | sed '/^$/d' | awk '!seen[$0]++' | paste -sd ',' -)"
+
+          jq -n \
+            --arg allow "$allow" \
+            --arg pass "$RESEND_SMTP_PASSWORD" \
+            '{external_email_enabled:true,mailer_secure_email_change_enabled:true,mailer_autoconfirm:false,site_url:"https://mobiuscommand.live",uri_allow_list:$allow,smtp_admin_email:"no-reply@auth.mobiuscommand.live",smtp_host:"smtp.resend.com",smtp_port:465,smtp_user:"resend",smtp_pass:$pass,smtp_sender_name:"Mobius Technologies"}' \
+            > /tmp/payload.json
+
+          curl --fail-with-body --silent --show-error \
+            -X PATCH \
+            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
+            --data-binary @/tmp/payload.json \
+            -o /tmp/after.json
+
+          jq -e '.smtp_host == "smtp.resend.com" and .smtp_port == 465 and .smtp_user == "resend" and .site_url == "https://mobiuscommand.live"' /tmp/after.json >/dev/null
+          jq -e '.uri_allow_list | contains("mobiuscompanion://auth/recovery") and contains("https://mobiuscommand.live/auth/recovery")' /tmp/after.json >/dev/null
+          echo 'result=PASS' >> "$GITHUB_OUTPUT"
+
+      - name: Publish report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.config.outputs.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="SMTP and recovery redirect activation: **${RESULT:-FAILED}**\n\nProject: Mobius-Platform\nSender: Mobius Technologies <no-reply@auth.mobiuscommand.live>\n\nNo database schema, RLS policy, user password, deployment, or source branch was modified. Secrets were not printed."
+          jq -n --arg title 'Supabase Auth Activation Report' --arg body "$body" '{title:$title,body:$body}' >/tmp/issue-payload.json
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data-binary @/tmp/issue-payload.json >/dev/null
