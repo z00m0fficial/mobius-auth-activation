@@ -1,0 +1,108 @@
+name: Name.com DNS Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/namecom-dns-diagnostic-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      NAMECOM_USERNAME: ${{ secrets.NAMECOM_USERNAME }}
+      NAMECOM_API_TOKEN: ${{ secrets.NAMECOM_API_TOKEN }}
+      TARGET_ZONE: mobiuscommand.live
+
+    steps:
+      - name: Diagnose target zone access
+        id: diagnostic
+        shell: bash
+        run: |
+          set +e
+
+          domains_file="$(mktemp)"
+          records_file="$(mktemp)"
+          trap 'rm -f "${domains_file}" "${records_file}"' EXIT
+
+          domains_code="$(curl --silent --show-error --output "${domains_file}" --write-out '%{http_code}' \
+            --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            'https://api.name.com/core/v1/domains?perPage=100')"
+
+          target_present='UNKNOWN'
+          if [[ "${domains_code}" -ge 200 && "${domains_code}" -lt 300 ]]; then
+            if jq -e --arg zone "${TARGET_ZONE}" '.domains[]? | select(.domainName == $zone)' "${domains_file}" >/dev/null 2>&1; then
+              target_present='YES'
+            else
+              target_present='NO'
+            fi
+          fi
+
+          records_code="$(curl --silent --show-error --output "${records_file}" --write-out '%{http_code}' \
+            --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            "https://api.name.com/core/v1/domains/${TARGET_ZONE}/records')"
+
+          records_shape='UNKNOWN'
+          api_message='NONE'
+          if jq -e . "${records_file}" >/dev/null 2>&1; then
+            records_shape="$(jq -r 'if type == "object" then (keys | sort | join(",")) else type end' "${records_file}")"
+            api_message="$(jq -r '[(.message // empty), (.details // empty)] | map(select(length > 0)) | join(" — ") | if length == 0 then "NONE" else . end' "${records_file}")"
+          fi
+
+          {
+            echo "domains_code=${domains_code}"
+            echo "target_present=${target_present}"
+            echo "records_code=${records_code}"
+            echo "records_shape=${records_shape}"
+            echo "api_message=${api_message}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish sanitized diagnostic report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOMAINS_CODE: ${{ steps.diagnostic.outputs.domains_code }}
+          TARGET_PRESENT: ${{ steps.diagnostic.outputs.target_present }}
+          RECORDS_CODE: ${{ steps.diagnostic.outputs.records_code }}
+          RECORDS_SHAPE: ${{ steps.diagnostic.outputs.records_shape }}
+          API_MESSAGE: ${{ steps.diagnostic.outputs.api_message }}
+        run: |
+          set -euo pipefail
+
+          body=$(cat <<EOF
+          ## Name.com DNS diagnostic
+
+          - List domains HTTP: **${DOMAINS_CODE:-UNKNOWN}**
+          - Target zone visible in account: **${TARGET_PRESENT:-UNKNOWN}**
+          - List target-zone records HTTP: **${RECORDS_CODE:-UNKNOWN}**
+          - Response keys/type: **${RECORDS_SHAPE:-UNKNOWN}**
+          - API diagnostic: **${API_MESSAGE:-NONE}**
+
+          Commit: ${GITHUB_SHA}
+
+          Read-only diagnostic only. No DNS records or account settings were changed, and no credentials were printed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title 'Name.com DNS Diagnostic Report' --arg body "${body}" '{title:$title,body:$body}')"
+          code="$(curl --silent --show-error --output /tmp/issue.json --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
