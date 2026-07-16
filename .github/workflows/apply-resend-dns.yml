@@ -1,0 +1,149 @@
+name: Apply Resend DNS Records
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/apply-resend-dns-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  apply-resend-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      NAMECOM_USERNAME: ${{ secrets.NAMECOM_USERNAME }}
+      NAMECOM_API_TOKEN: ${{ secrets.NAMECOM_API_TOKEN }}
+      ZONE: mobiuscommand.live
+
+    steps:
+      - name: Add only missing Resend DNS records
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API="https://api.name.com/core/v1/domains/${ZONE}/records"
+          records_file="$(mktemp)"
+          trap 'rm -f "${records_file}"' EXIT
+
+          list_code="$(curl --silent --show-error --output "${records_file}" --write-out '%{http_code}' \
+            --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            "${API}")"
+
+          if [[ "${list_code}" -lt 200 || "${list_code}" -ge 300 ]]; then
+            echo "Unable to read existing DNS records. HTTP ${list_code}."
+            exit 1
+          fi
+
+          create_record() {
+            local label="$1"
+            local host="$2"
+            local type="$3"
+            local answer="$4"
+            local priority="$5"
+            local exact same payload code
+
+            if [[ "${type}" == "MX" ]]; then
+              exact="$(jq --arg h "${host}" --arg t "${type}" --arg a "${answer}" --argjson p "${priority}" '[.records[] | select(.host == $h and .type == $t and .answer == $a and (.priority // 0) == $p)] | length' "${records_file}")"
+            else
+              exact="$(jq --arg h "${host}" --arg t "${type}" --arg a "${answer}" '[.records[] | select(.host == $h and .type == $t and .answer == $a)] | length' "${records_file}")"
+            fi
+
+            same="$(jq --arg h "${host}" --arg t "${type}" '[.records[] | select(.host == $h and .type == $t)] | length' "${records_file}")"
+
+            if [[ "${exact}" -gt 0 ]]; then
+              echo "${label}=ALREADY_PRESENT" >> "${GITHUB_OUTPUT}"
+              return 0
+            fi
+
+            if [[ "${same}" -gt 0 ]]; then
+              echo "${label}=CONFLICT_REVIEW_REQUIRED" >> "${GITHUB_OUTPUT}"
+              return 0
+            fi
+
+            if [[ "${type}" == "MX" ]]; then
+              payload="$(jq -n --arg host "${host}" --arg type "${type}" --arg answer "${answer}" --argjson priority "${priority}" '{host:$host,type:$type,answer:$answer,priority:$priority,ttl:300}')"
+            else
+              payload="$(jq -n --arg host "${host}" --arg type "${type}" --arg answer "${answer}" '{host:$host,type:$type,answer:$answer,ttl:300}')"
+            fi
+
+            code="$(curl --silent --show-error --output /tmp/namecom-create.json --write-out '%{http_code}' \
+              --request POST \
+              --user "${NAMECOM_USERNAME}:${NAMECOM_API_TOKEN}" \
+              --header 'Accept: application/json' \
+              --header 'Content-Type: application/json' \
+              "${API}" \
+              --data "${payload}")"
+
+            if [[ "${code}" -ge 200 && "${code}" -lt 300 ]]; then
+              echo "${label}=CREATED" >> "${GITHUB_OUTPUT}"
+            else
+              echo "${label}=FAILED_HTTP_${code}" >> "${GITHUB_OUTPUT}"
+            fi
+            rm -f /tmp/namecom-create.json
+          }
+
+          create_record \
+            dkim \
+            'resend._domainkey.auth' \
+            'TXT' \
+            'p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwgG2iWs75ucc4rEkxw5zCXEDixVGFU4N8CFnzLkC2udN0+LtmTbPncnqRhfkJBSu0R1lXE3DnFFSKWN4ZMLh00aTJAHQlRuo0qLppNLoArzo5Nm9tZvEzGzZdmBs/SCApVqEocgebswpANSkJ0HCwG3kdLZeGDS2nLDUlPdil+QIDAQAB' \
+            0
+
+          create_record \
+            mail_from_mx \
+            'send.auth' \
+            'MX' \
+            'feedback-smtp.us-east-1.amazonses.com' \
+            10
+
+          create_record \
+            mail_from_spf \
+            'send.auth' \
+            'TXT' \
+            'v=spf1 include:amazonses.com ~all' \
+            0
+
+      - name: Publish sanitized DNS change report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DKIM_RESULT: ${{ steps.apply.outputs.dkim }}
+          MX_RESULT: ${{ steps.apply.outputs.mail_from_mx }}
+          SPF_RESULT: ${{ steps.apply.outputs.mail_from_spf }}
+        run: |
+          set -euo pipefail
+
+          body=$(cat <<EOF
+          ## Resend DNS activation result
+
+          - DKIM TXT: **${DKIM_RESULT:-WORKFLOW_FAILED}**
+          - MAIL FROM MX: **${MX_RESULT:-WORKFLOW_FAILED}**
+          - MAIL FROM SPF TXT: **${SPF_RESULT:-WORKFLOW_FAILED}**
+
+          Commit: ${GITHUB_SHA}
+
+          Safety controls: this workflow created only records that were completely absent. It did not delete, overwrite, or replace any existing DNS record. Any same-host/type mismatch is reported as a conflict for manual review. No secret values were printed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title 'Resend DNS Activation Report' --arg body "${body}" '{title:$title,body:$body}')"
+          code="$(curl --silent --show-error --output /tmp/issue.json --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
