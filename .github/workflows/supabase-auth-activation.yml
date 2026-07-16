@@ -25,45 +25,76 @@ jobs:
         id: config
         shell: bash
         run: |
-          set -euo pipefail
-          [[ -n "${SUPABASE_ACCESS_TOKEN:-}" ]]
-          [[ -n "${RESEND_SMTP_PASSWORD:-}" ]]
+          set -u
+          result=FAILED
+          stage=secret_validation
+          detail=unknown
 
-          curl --fail-with-body --silent --show-error \
-            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
-            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
-            -o /tmp/before.json
+          if [[ -z "${SUPABASE_ACCESS_TOKEN:-}" || -z "${RESEND_SMTP_PASSWORD:-}" ]]; then
+            detail=missing_required_secret
+          else
+            stage=read_existing_config
+            get_code="$(curl --silent --show-error --output /tmp/before.json --write-out '%{http_code}' \
+              -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+              "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth")"
 
-          current="$(jq -r '.uri_allow_list // ""' /tmp/before.json)"
-          allow="$(printf '%s\n%s\n%s\n' "$current" 'https://mobiuscommand.live/auth/recovery' 'mobiuscompanion://auth/recovery' | tr ',' '\n' | sed '/^$/d' | awk '!seen[$0]++' | paste -sd ',' -)"
+            if [[ "$get_code" -lt 200 || "$get_code" -ge 300 ]]; then
+              detail="get_http_${get_code}_$(jq -r '.message // .error // .code // "unknown"' /tmp/before.json 2>/dev/null | cut -c1-120)"
+            else
+              current="$(jq -r '.uri_allow_list // ""' /tmp/before.json)"
+              allow="$(printf '%s\n%s\n%s\n' "$current" 'https://mobiuscommand.live/auth/recovery' 'mobiuscompanion://auth/recovery' | tr ',' '\n' | sed '/^$/d' | awk '!seen[$0]++' | paste -sd ',' -)"
 
-          jq -n \
-            --arg allow "$allow" \
-            --arg pass "$RESEND_SMTP_PASSWORD" \
-            '{external_email_enabled:true,mailer_secure_email_change_enabled:true,mailer_autoconfirm:false,site_url:"https://mobiuscommand.live",uri_allow_list:$allow,smtp_admin_email:"no-reply@auth.mobiuscommand.live",smtp_host:"smtp.resend.com",smtp_port:465,smtp_user:"resend",smtp_pass:$pass,smtp_sender_name:"Mobius Technologies"}' \
-            > /tmp/payload.json
+              jq -n \
+                --arg allow "$allow" \
+                --arg pass "$RESEND_SMTP_PASSWORD" \
+                '{external_email_enabled:true,mailer_secure_email_change_enabled:true,mailer_autoconfirm:false,site_url:"https://mobiuscommand.live",uri_allow_list:$allow,smtp_admin_email:"no-reply@auth.mobiuscommand.live",smtp_host:"smtp.resend.com",smtp_port:"465",smtp_user:"resend",smtp_pass:$pass,smtp_sender_name:"Mobius Technologies"}' \
+                > /tmp/payload.json
 
-          curl --fail-with-body --silent --show-error \
-            -X PATCH \
-            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
-            --data-binary @/tmp/payload.json \
-            -o /tmp/after.json
+              stage=patch_auth_config
+              patch_code="$(curl --silent --show-error --output /tmp/after.json --write-out '%{http_code}' \
+                -X PATCH \
+                -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
+                --data-binary @/tmp/payload.json)"
 
-          jq -e '.smtp_host == "smtp.resend.com" and .smtp_port == 465 and .smtp_user == "resend" and .site_url == "https://mobiuscommand.live"' /tmp/after.json >/dev/null
-          jq -e '.uri_allow_list | contains("mobiuscompanion://auth/recovery") and contains("https://mobiuscommand.live/auth/recovery")' /tmp/after.json >/dev/null
-          echo 'result=PASS' >> "$GITHUB_OUTPUT"
+              if [[ "$patch_code" -lt 200 || "$patch_code" -ge 300 ]]; then
+                detail="patch_http_${patch_code}_$(jq -r '.message // .error // .code // "unknown"' /tmp/after.json 2>/dev/null | cut -c1-120)"
+              else
+                stage=verify_auth_config
+                smtp_host="$(jq -r '.smtp_host // ""' /tmp/after.json)"
+                smtp_port="$(jq -r '.smtp_port // ""' /tmp/after.json)"
+                smtp_user="$(jq -r '.smtp_user // ""' /tmp/after.json)"
+                site_url="$(jq -r '.site_url // ""' /tmp/after.json)"
+                uri_allow="$(jq -r '.uri_allow_list // ""' /tmp/after.json)"
+
+                if [[ "$smtp_host" == 'smtp.resend.com' && "$smtp_port" == '465' && "$smtp_user" == 'resend' && "$site_url" == 'https://mobiuscommand.live' && "$uri_allow" == *'mobiuscompanion://auth/recovery'* && "$uri_allow" == *'https://mobiuscommand.live/auth/recovery'* ]]; then
+                  result=PASS
+                  detail=config_verified
+                else
+                  detail="verification_mismatch_host_${smtp_host}_port_${smtp_port}_user_${smtp_user}_site_${site_url}"
+                fi
+              fi
+            fi
+          fi
+
+          echo "result=${result}" >> "$GITHUB_OUTPUT"
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "detail=${detail}" >> "$GITHUB_OUTPUT"
+
+          [[ "$result" == PASS ]]
 
       - name: Publish report
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ steps.config.outputs.result }}
+          STAGE: ${{ steps.config.outputs.stage }}
+          DETAIL: ${{ steps.config.outputs.detail }}
         shell: bash
         run: |
           set -euo pipefail
-          body="SMTP and recovery redirect activation: **${RESULT:-FAILED}**\n\nProject: Mobius-Platform\nSender: Mobius Technologies <no-reply@auth.mobiuscommand.live>\n\nNo database schema, RLS policy, user password, deployment, or source branch was modified. Secrets were not printed."
+          body="SMTP and recovery redirect activation: **${RESULT:-FAILED}**\n\nStage: **${STAGE:-unknown}**\nSanitized detail: **${DETAIL:-unknown}**\nProject: Mobius-Platform\nSender: Mobius Technologies <no-reply@auth.mobiuscommand.live>\n\nNo database schema, RLS policy, user password, deployment, or source branch was modified. Secrets were not printed."
           jq -n --arg title 'Supabase Auth Activation Report' --arg body "$body" '{title:$title,body:$body}' >/tmp/issue-payload.json
           curl --fail-with-body --silent --show-error \
             -X POST \
