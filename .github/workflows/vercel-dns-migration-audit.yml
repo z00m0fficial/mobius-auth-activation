@@ -1,0 +1,163 @@
+name: Vercel DNS Migration Audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/vercel-dns-migration-audit-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      DOMAIN: mobiuscommand.live
+      TEAM_ID: team_GHfqpICAl1KywvDngfAW7TR6
+
+    steps:
+      - name: Compare Vercel and authoritative DNS
+        id: audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${VERCEL_TOKEN:-}" ]]; then
+            echo "VERCEL_TOKEN is missing."
+            exit 1
+          fi
+
+          records_file="$(mktemp)"
+          transfer_file="$(mktemp)"
+          trap 'rm -f "${records_file}" "${transfer_file}"' EXIT
+
+          records_code="$(curl --silent --show-error \
+            --output "${records_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v5/domains/${DOMAIN}/records?limit=100&teamId=${TEAM_ID}")"
+
+          transfer_code="$(curl --silent --show-error \
+            --output "${transfer_file}" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v1/registrar/domains/${DOMAIN}/transfer?teamId=${TEAM_ID}")"
+
+          transfer_status='NOT_REGISTERED_WITH_VERCEL_OR_NO_TRANSFER'
+          transfer_message='NONE'
+          if jq -e . "${transfer_file}" >/dev/null 2>&1; then
+            transfer_status="$(jq -r '.status // .code // "UNKNOWN"' "${transfer_file}")"
+            transfer_message="$(jq -r '.message // "NONE"' "${transfer_file}")"
+          fi
+
+          vercel_record_count='UNKNOWN'
+          vercel_record_names='UNKNOWN'
+          if [[ "${records_code}" -ge 200 && "${records_code}" -lt 300 ]] && jq -e . "${records_file}" >/dev/null 2>&1; then
+            vercel_record_count="$(jq -r '(.records // .) | if type == "array" then length else "UNKNOWN" end' "${records_file}")"
+            vercel_record_names="$(jq -r '(.records // .) | if type == "array" then map((.type // "UNKNOWN") + ":" + ((.name // "@") | if . == "" then "@" else . end)) | sort | join(", ") else "UNKNOWN" end' "${records_file}")"
+          fi
+
+          ns="$(dig +short NS "${DOMAIN}" | sort | paste -sd ',' -)"
+          apex_a="$(dig +short A "${DOMAIN}" | sort | paste -sd ',' -)"
+          apex_aaaa="$(dig +short AAAA "${DOMAIN}" | sort | paste -sd ',' -)"
+          www_cname="$(dig +short CNAME "www.${DOMAIN}" | sort | paste -sd ',' -)"
+          dkim="$(dig +short TXT "resend._domainkey.auth.${DOMAIN}" | tr -d '"' | paste -sd ' ' -)"
+          mail_mx="$(dig +short MX "send.auth.${DOMAIN}" | sort | paste -sd ',' -)"
+          mail_spf="$(dig +short TXT "send.auth.${DOMAIN}" | tr -d '"' | paste -sd ' ' -)"
+          dmarc="$(dig +short TXT "_dmarc.auth.${DOMAIN}" | tr -d '"' | paste -sd ' ' -)"
+
+          redact_txt() {
+            local value="$1"
+            if [[ -z "${value}" ]]; then
+              echo 'NOT_PRESENT'
+            else
+              printf 'PRESENT_SHA256_%s' "$(printf '%s' "${value}" | sha256sum | cut -c1-12)"
+            fi
+          }
+
+          {
+            echo "records_code=${records_code}"
+            echo "transfer_code=${transfer_code}"
+            echo "transfer_status=${transfer_status}"
+            echo "transfer_message=${transfer_message}"
+            echo "vercel_record_count=${vercel_record_count}"
+            echo "vercel_record_names=${vercel_record_names}"
+            echo "ns=${ns:-NONE}"
+            echo "apex_a=${apex_a:-NONE}"
+            echo "apex_aaaa=${apex_aaaa:-NONE}"
+            echo "www_cname=${www_cname:-NONE}"
+            echo "dkim=$(redact_txt "${dkim}")"
+            echo "mail_mx=${mail_mx:-NOT_PRESENT}"
+            echo "mail_spf=$(redact_txt "${mail_spf}")"
+            echo "dmarc=$(redact_txt "${dmarc}")"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish sanitized migration audit
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECORDS_CODE: ${{ steps.audit.outputs.records_code }}
+          TRANSFER_CODE: ${{ steps.audit.outputs.transfer_code }}
+          TRANSFER_STATUS: ${{ steps.audit.outputs.transfer_status }}
+          TRANSFER_MESSAGE: ${{ steps.audit.outputs.transfer_message }}
+          VERCEL_RECORD_COUNT: ${{ steps.audit.outputs.vercel_record_count }}
+          VERCEL_RECORD_NAMES: ${{ steps.audit.outputs.vercel_record_names }}
+          NS: ${{ steps.audit.outputs.ns }}
+          APEX_A: ${{ steps.audit.outputs.apex_a }}
+          APEX_AAAA: ${{ steps.audit.outputs.apex_aaaa }}
+          WWW_CNAME: ${{ steps.audit.outputs.www_cname }}
+          DKIM: ${{ steps.audit.outputs.dkim }}
+          MAIL_MX: ${{ steps.audit.outputs.mail_mx }}
+          MAIL_SPF: ${{ steps.audit.outputs.mail_spf }}
+          DMARC: ${{ steps.audit.outputs.dmarc }}
+        run: |
+          set -euo pipefail
+
+          body=$(cat <<EOF
+          ## Vercel DNS migration audit
+
+          - Vercel records API HTTP: **${RECORDS_CODE:-FAILED}**
+          - Vercel registrar/transfer API HTTP: **${TRANSFER_CODE:-FAILED}**
+          - Registrar/transfer status: **${TRANSFER_STATUS:-UNKNOWN}**
+          - Registrar message: **${TRANSFER_MESSAGE:-NONE}**
+          - Vercel DNS record count: **${VERCEL_RECORD_COUNT:-UNKNOWN}**
+          - Vercel DNS record names/types: **${VERCEL_RECORD_NAMES:-UNKNOWN}**
+
+          ## Current authoritative DNS
+
+          - Nameservers: **${NS:-NONE}**
+          - Apex A: **${APEX_A:-NONE}**
+          - Apex AAAA: **${APEX_AAAA:-NONE}**
+          - www CNAME: **${WWW_CNAME:-NONE}**
+          - Resend DKIM: **${DKIM:-UNKNOWN}**
+          - Resend MAIL FROM MX: **${MAIL_MX:-UNKNOWN}**
+          - Resend MAIL FROM SPF: **${MAIL_SPF:-UNKNOWN}**
+          - DMARC for auth subdomain: **${DMARC:-UNKNOWN}**
+
+          Commit: ${GITHUB_SHA}
+
+          Read-only audit. TXT record contents were not printed; only truncated hashes are reported. No DNS, domain, registrar, email, deployment, Supabase, or production setting was changed.
+          EOF
+          )
+
+          payload="$(jq -n --arg title 'Vercel DNS Migration Audit Report' --arg body "${body}" '{title:$title,body:$body}')"
+          code="$(curl --silent --show-error --output /tmp/issue.json --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
