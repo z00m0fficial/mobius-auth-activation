@@ -1,0 +1,100 @@
+name: Vercel Resend MX Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/vercel-resend-mx-trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  apply-mx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      DOMAIN: mobiuscommand.live
+      TEAM_ID: team_GHfqpICAl1KywvDngfAW7TR6
+      RECORD_NAME: send.auth
+      RECORD_VALUE: feedback-smtp.us-east-1.amazonses.com
+      RECORD_PRIORITY: '10'
+
+    steps:
+      - name: Create missing MAIL FROM MX record
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          records_file="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "${records_file}" "${response_file}"' EXIT
+
+          list_code="$(curl --silent --show-error --output "${records_file}" --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v5/domains/${DOMAIN}/records?limit=100&teamId=${TEAM_ID}")"
+
+          [[ "${list_code}" -ge 200 && "${list_code}" -lt 300 ]]
+
+          exact="$(jq --arg n "${RECORD_NAME}" --arg v "${RECORD_VALUE}" --arg p "${RECORD_PRIORITY}" '[.records[]? | select((.name // "") == $n and .type == "MX" and (.value // "") == $v and ((.mxPriority // .priority // "0") | tostring) == $p)] | length' "${records_file}")"
+          same="$(jq --arg n "${RECORD_NAME}" '[.records[]? | select((.name // "") == $n and .type == "MX")] | length' "${records_file}")"
+
+          if [[ "${exact}" -gt 0 ]]; then
+            echo 'result=ALREADY_PRESENT' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${same}" -gt 0 ]]; then
+            echo 'result=CONFLICT_REVIEW_REQUIRED' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          payload="$(jq -n \
+            --arg type 'MX' \
+            --arg name "${RECORD_NAME}" \
+            --arg value "${RECORD_VALUE}" \
+            --argjson ttl 60 \
+            --argjson mxPriority 10 \
+            '{type:$type,name:$name,value:$value,ttl:$ttl,mxPriority:$mxPriority}')"
+
+          code="$(curl --silent --show-error --output "${response_file}" --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${VERCEL_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            "https://api.vercel.com/v2/domains/${DOMAIN}/records?teamId=${TEAM_ID}" \
+            --data "${payload}")"
+
+          if [[ "${code}" -ge 200 && "${code}" -lt 300 ]]; then
+            echo 'result=CREATED' >> "${GITHUB_OUTPUT}"
+          else
+            error_code="$(jq -r '.error.code // .code // "UNKNOWN"' "${response_file}" 2>/dev/null || echo UNKNOWN)"
+            echo "result=FAILED_HTTP_${code}_${error_code}" >> "${GITHUB_OUTPUT}"
+            exit 1
+          fi
+
+      - name: Publish sanitized MX report
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.apply.outputs.result }}
+        run: |
+          set -euo pipefail
+          body="MAIL FROM MX result: **${RESULT:-WORKFLOW_FAILED}**\n\nCommit: ${GITHUB_SHA}\n\nNo existing DNS record was changed or deleted. No secret values were printed."
+          payload="$(jq -n --arg title 'Vercel Resend MX Fix Report' --arg body "${body}" '{title:$title,body:$body}')"
+          code="$(curl --silent --show-error --output /tmp/issue.json --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            --data "${payload}")"
+          [[ "${code}" == "201" ]]
+          rm -f /tmp/issue.json
