@@ -4,7 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/supabase-auth-activation-trigger]
+    paths:
+      - .github/workflows/supabase-auth-activation.yml
+      - .github/supabase-auth-activation-trigger
 
 permissions:
   contents: read
